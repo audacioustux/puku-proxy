@@ -33,24 +33,28 @@ export async function* proxyChatCompletion(
 
 /**
  * Render an OpenAI-style messages array as a single prompt string that the
- * puku agent will understand. We keep it simple — system goes first, then
- * user/assistant alternation. Empty assistant turns are skipped.
+ * puku agent will understand. System / user / assistant / tool / function are
+ * all included. Multi-part content (OpenAI's array shape for vision, audio,
+ * etc.) is collapsed to a single string by concatenating text parts and
+ * dropping non-text parts (with a note so the model sees what was there).
+ *
+ * Tool-result history is preserved by re-emitting tool messages verbatim —
+ * the puku agent sees the prior tool-call output as part of the conversation
+ * even though it can't act on it (maxTurns: 1).
  */
 export function messagesToPrompt(messages: ChatRequest["messages"]): string {
   const lines: string[] = [];
   for (const m of messages) {
-    const content = m.content.trim();
-    if (!content) continue;
-    switch (m.role) {
-      case "system":
-        lines.push(`<system>\n${content}\n</system>`);
-        break;
-      case "user":
-        lines.push(`<user>\n${content}\n</user>`);
-        break;
-      case "assistant":
-        lines.push(`<assistant>\n${content}\n</assistant>`);
-        break;
+    const text = contentToText(m.content).trim();
+    const role = m.role;
+    const tag = role; // system/user/assistant/tool/function
+    if (text) {
+      lines.push(`<${tag}>\n${text}\n</${tag}>`);
+    } else if (role === "tool" || role === "function") {
+      // Tool/function message with no extractable text (e.g. an image-only
+      // tool result). Still emit a marker so the model knows something was
+      // there.
+      lines.push(`<${tag}>\n[non-text content]\n</${tag}>`);
     }
   }
   if (lines.length === 0) {
@@ -58,6 +62,33 @@ export function messagesToPrompt(messages: ChatRequest["messages"]): string {
     return "(empty conversation)";
   }
   return lines.join("\n\n");
+}
+
+/**
+ * Extract plain text from an OpenAI message content. Accepts:
+ *   - a string (returned as-is)
+ *   - an array of content parts (text parts concatenated, others summarized)
+ *
+ * Non-text parts (image_url, audio, file, etc.) become `[image]`, `[audio]`,
+ * etc. so the model at least knows content was present. The full image data
+ * is dropped — puku-cli's upstream doesn't accept image content parts.
+ */
+export function contentToText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    if (typeof part !== "object" || part === null) continue;
+    const p = part as { type?: unknown; text?: unknown };
+    if (p.type === "text" && typeof p.text === "string") {
+      parts.push(p.text);
+      continue;
+    }
+    if (typeof p.type === "string") {
+      parts.push(`[${p.type}]`);
+    }
+  }
+  return parts.join("\n");
 }
 
 /**

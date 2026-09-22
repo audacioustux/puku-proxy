@@ -1,35 +1,49 @@
 /**
  * OpenAI-compatible request/response types + zod validation.
  *
- * Only the fields we actually translate are validated strictly. Unknown fields
- * are accepted (passthrough) so existing OpenAI clients don't break, but we log
- * a warning for anything we don't honor.
+ * The proxy is a dumb pipe. Anything OpenAI-shape is forwarded to puku-cli;
+ * puku-cli decides what it accepts and returns its own (real) error if the
+ * shape is wrong. We only validate the three things we actually need to read
+ * (`model`, `messages[]`, `stream`) — everything else is passthrough.
+ *
+ * `messages[].role` includes `"tool"` and `"function"` because real
+ * OpenAI agent loops carry tool-result history. `messages[].content` accepts
+ * a string or an array of content parts (OpenAI's vision/multi-part shape).
+ * Whether puku-cli honors these is its problem, not ours.
  */
 
 import { z } from "zod";
 
-export const ChatMessageSchema = z.object({
-  role: z.enum(["system", "user", "assistant"]),
-  content: z.string(),
-  name: z.string().optional(),
-});
+// A single content part inside a multi-part `content` array. We accept
+// anything OpenAI accepts: text, image_url, etc. The proxy doesn't introspect
+// parts — they're passed through verbatim.
+export const ContentPartSchema = z
+  .object({ type: z.string().optional() })
+  .passthrough();
 
-export const ChatRequestSchema = z.object({
-  model: z.string().min(1).default("puku-default"),
-  messages: z.array(ChatMessageSchema).min(1),
-  stream: z.boolean().optional().default(false),
-  // These are accepted but currently ignored. Listed here so we can warn on them.
-  temperature: z.number().optional(),
-  top_p: z.number().optional(),
-  n: z.number().int().positive().optional(),
-  max_tokens: z.number().int().positive().optional(),
-  presence_penalty: z.number().optional(),
-  frequency_penalty: z.number().optional(),
-  user: z.string().optional(),
-});
+export const ChatMessageSchema = z
+  .object({
+    role: z.enum(["system", "user", "assistant", "tool", "function"]),
+    content: z.union([z.string(), z.array(ContentPartSchema)]),
+    name: z.string().optional(),
+    // Tool-call/message fields OpenAI agent loops carry. Forwarded to puku-cli
+    // as-is; we don't translate them.
+    tool_call_id: z.string().optional(),
+    tool_calls: z.array(z.object({}).passthrough()).optional(),
+  })
+  .passthrough();
 
-// Tools / functions / logprobs are out of scope for v1 — reject explicitly so
-// clients get a clear error rather than silent data loss.
+export const ChatRequestSchema = z
+  .object({
+    model: z.string().min(1).default("puku-default"),
+    messages: z.array(ChatMessageSchema).min(1),
+    stream: z.boolean().optional().default(false),
+  })
+  .passthrough();
+
+// Fields we *know* puku-cli will ignore if present. Logged so we know when
+// clients depend on something the proxy won't translate, but never rejected —
+// if puku-cli eventually supports them they'll just start working.
 export const UnsupportedFields = [
   "tools",
   "tool_choice",
@@ -41,6 +55,13 @@ export const UnsupportedFields = [
   "seed",
   "stop",
   "logit_bias",
+  "temperature",
+  "top_p",
+  "n",
+  "max_tokens",
+  "presence_penalty",
+  "frequency_penalty",
+  "user",
 ] as const;
 
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;
@@ -88,27 +109,12 @@ export interface OpenAIError {
 }
 
 /**
- * Walk an unknown ChatRequest body and return the names of fields that look
- * supported but aren't, plus outright unsupported fields. Empty array = fine.
+ * Walk an unknown ChatRequest body and return the names of fields the proxy
+ * recognizes but doesn't translate. Empty array = fine. We do NOT walk into
+ * messages[] — per-message schema mismatches are puku-cli's job, not ours.
  */
 export function findUnsupportedFields(body: unknown): string[] {
   if (typeof body !== "object" || body === null) return [];
   const obj = body as Record<string, unknown>;
-  const warn: string[] = [];
-  const ignored: Array<keyof ChatRequest | "temperature" | "top_p" | "n" | "max_tokens" | "presence_penalty" | "frequency_penalty" | "user"> = [
-    "temperature",
-    "top_p",
-    "n",
-    "max_tokens",
-    "presence_penalty",
-    "frequency_penalty",
-    "user",
-  ];
-  for (const field of ignored) {
-    if (field in obj) warn.push(field);
-  }
-  for (const field of UnsupportedFields) {
-    if (field in obj) warn.push(field);
-  }
-  return warn;
+  return UnsupportedFields.filter((f) => f in obj);
 }
