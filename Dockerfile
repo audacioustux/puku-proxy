@@ -63,8 +63,11 @@ RUN echo "puku-proxy runtime cachebust: ${CACHEBUST}" \
     && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/* \
     && cd /tmp \
+    # BuildKit sets TARGETARCH to Go's arch name (amd64/arm64). Bun's GitHub
+    # release asset uses a different convention (x64/aarch64). Map the names.
+    && BUN_ARCH=$([ "${TARGETARCH:-amd64}" = "amd64" ] && echo "x64" || ([ "${TARGETARCH}" = "arm64" ] && echo "aarch64" || echo "${TARGETARCH}")) \
     && curl -fsSL -o bun.zip \
-         "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${TARGETARCH:-x64}.zip" \
+         "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip" \
     && unzip -o bun.zip \
     && mv bun-linux-*/bun /usr/local/bin/bun \
     && rm -rf bun.zip bun-linux-* \
