@@ -13,6 +13,12 @@
 # occasionally mishandles such peers, and we want a known-good runtime.
 
 ARG BUN_VERSION=1.4.2
+# CACHEBUST 2026-09-22T14:25Z — bump this comment to invalidate BuildKit layer
+# cache for the runtime stage after the runtime base image changes. Without
+# this, Dokploy's buildkit can replay a cached layer that succeeded/failed with
+# the previous base image. The comment itself isn't executed; it just makes
+# the file change so the cache key changes.
+ARG CACHEBUST=run-2026-09-22T14-25Z
 
 # ---- Build stage ----
 FROM oven/bun:${BUN_VERSION} AS build
@@ -34,6 +40,17 @@ RUN bun install --production --frozen-lockfile
 
 # ---- Runtime stage ----
 FROM oven/bun:${BUN_VERSION} AS runtime
+
+# Re-declare CACHEBUST inside this stage (global ARGs go out of scope after
+# each FROM). The value is forwarded via `--build-arg CACHEBUST=...` from
+# compose.yml, or defaults to the dated sentinel baked in at line 21.
+ARG CACHEBUST=run-2026-09-22T14-25Z
+
+# Force a layer cache miss for everything below by referencing CACHEBUST.
+# The empty echo runs once and changes the layer hash. Bump the value of
+# CACHEBUST (in compose.yml's `args:` block, or in the default above) to
+# invalidate downstream layers after a runtime base image change.
+RUN echo "puku-proxy runtime cachebust: ${CACHEBUST}"
 
 # puku-cli is the upstream CLI spawned by puku-agent-sdk. The npm tarball
 # contains a wrapper script that depends on @puku/puku-cli being installed
