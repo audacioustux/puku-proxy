@@ -3,8 +3,10 @@
 # Multi-stage build for puku-proxy.
 #
 # Stage 1 (oven/bun:1.4.2): install deps and bundle the source.
-# Stage 2 (oven/bun:1.4.2-slim): runtime image with @puku/puku-cli installed,
-# non-root, exposes 8787.
+# Stage 2 (oven/bun:1.4.2): runtime image with @puku/puku-cli installed via
+# npm, non-root, exposes 8787. We use the full oven/bun image (not -slim)
+# because puku-cli is installed via npm and the slim variant doesn't ship
+# npm.
 #
 # We use `bun build --target=bun` rather than `--compile` because puku-agent-sdk
 # pulls in @sentry/bun, which is a real Node package — compile-time bundling
@@ -31,7 +33,7 @@ RUN bun build src/server.ts --target=bun --outfile=dist/server.js
 RUN bun install --production --frozen-lockfile
 
 # ---- Runtime stage ----
-FROM oven/bun:${BUN_VERSION}-slim AS runtime
+FROM oven/bun:${BUN_VERSION} AS runtime
 
 # puku-cli is the upstream CLI spawned by puku-agent-sdk. The npm tarball
 # contains a wrapper script that depends on @puku/puku-cli being installed
