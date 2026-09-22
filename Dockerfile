@@ -3,23 +3,30 @@
 # Multi-stage build for puku-proxy.
 #
 # Stage 1 (oven/bun:1.4.2): install deps and bundle the source.
-# Stage 2 (oven/bun:1.4.2-slim): runtime image with puku-cli installed via
-# bun (not npm — the oven/bun image ships no npm/node). puku-cli is a pure
-# ESM script with a `#!/usr/bin/env node` shebang; we rewrite that to `bun`
-# in-place and skip puku-cli's Node-only heap re-exec via
-# PUKU_CLI_DISABLE_HEAP_RELAUNCH=1. Image stays slim (~80MB).
+# Stage 2 (oven/bun:1.4.2-debian): runtime image with build-essential +
+# puku-cli installed via bun (oven/bun images ship no npm/node, so `bun
+# add -g` is the only path). puku-cli is an ESM script with
+# `#!/usr/bin/env node` shebang; we rewrite it to bun and disable
+# puku-cli's Node-only heap re-exec via PUKU_CLI_DISABLE_HEAP_RELAUNCH=1.
+#
+# puku-cli transitively pulls better-sqlite3@12.9.0, which has a native
+# binding that Bun's prebuilt picker can't satisfy (target=node, not
+# bun), so node-gyp falls back to compiling from source. That requires
+# a C/C++ toolchain + python3 — both present on -debian, but only
+# python3 is preinstalled, so we apt-get install build-essential here.
+# Final image ~400MB; trim when puku-cli drops the SQLite dep.
 #
 # We use `bun build --target=bun` rather than `--compile` because puku-agent-sdk
 # pulls in @sentry/bun, which is a real Node package — compile-time bundling
 # occasionally mishandles such peers, and we want a known-good runtime.
 
 ARG BUN_VERSION=1.4.2
-# CACHEBUST 2026-09-22T15:05Z — bump this comment to invalidate BuildKit layer
+# CACHEBUST 2026-09-22T15:30Z — bump this comment to invalidate BuildKit layer
 # cache for the runtime stage after the runtime base image changes. Without
 # this, Dokploy's buildkit can replay a cached layer that succeeded/failed with
 # the previous base image. The comment itself isn't executed; it just makes
 # the file change so the cache key changes.
-ARG CACHEBUST=run-2026-09-22T15-05Z
+ARG CACHEBUST=run-2026-09-22T15-30Z
 
 # ---- Build stage ----
 FROM oven/bun:${BUN_VERSION} AS build
@@ -40,24 +47,35 @@ RUN bun build src/server.ts --target=bun --outfile=dist/server.js
 RUN bun install --production --frozen-lockfile
 
 # ---- Runtime stage ----
-FROM oven/bun:${BUN_VERSION}-slim AS runtime
+# oven/bun:1.4.2-debian ships python3 (for node-gyp) but no C/C++ toolchain.
+# puku-cli@1.8.56 transitively pulls better-sqlite3@12.9.0, which has a
+# native binding that needs to compile from source — node-gyp finds Python
+# (good) but then fails to find a compiler. Install build-essential here.
+# This is a one-time build-time cost; the toolchain persists in the final
+# image (~+250MB). When Bun ships a better-sqlite3 replacement or puku-cli
+# drops the dep, swap back to oven/bun:1.4.2-slim and drop this layer.
+FROM oven/bun:${BUN_VERSION}-debian AS runtime
 
 # Re-declare CACHEBUST inside this stage (global ARGs go out of scope after
 # each FROM). The value is forwarded via `--build-arg CACHEBUST=...` from
 # compose.yml, or defaults to the dated sentinel baked in at line 21.
-ARG CACHEBUST=run-2026-09-22T15-05Z
+ARG CACHEBUST=run-2026-09-22T15-30Z
 
 # Force a layer cache miss for everything below by referencing CACHEBUST.
 # The empty echo runs once and changes the layer hash. Bump the value of
 # CACHEBUST (in compose.yml's `args:` block, or in the default above) to
 # invalidate downstream layers after a runtime base image change.
-RUN echo "puku-proxy runtime cachebust: ${CACHEBUST}"
+RUN echo "puku-proxy runtime cachebust: ${CACHEBUST}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # puku-cli is the upstream CLI spawned by puku-agent-sdk. It ships as a
 # Node script (`#!/usr/bin/env node`) but uses only Node APIs that Bun
 # implements (fs/path/url/child_process). Install via `bun add -g` (npm
 # isn't available in oven/bun images), rewrite the shebang to bun, and
-# disable puku-cli's Node-only heap re-exec.
+# disable puku-cli's Node-only heap re-exec. better-sqlite3 compiles here
+# using the build-essential + python3 we just installed.
 #
 # Run as `bun` user so the global bin dir (default $HOME/.bun/bin) lands
 # in the same user's home — and stay as `bun` for the rest of the image.
