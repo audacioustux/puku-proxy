@@ -27,6 +27,7 @@ import {
 import { healthResponse } from "./health.ts";
 import { loadAuthTokens, verifyRequest } from "./auth.ts";
 import { getModelList, startModelListRefresh } from "./models.ts";
+import { debug, debugEnabled, nextRequestId } from "./debug.ts";
 
 // ---- Helpers ----
 
@@ -46,6 +47,15 @@ async function handleModels(): Promise<Response> {
 }
 
 async function handleChat(req: Request): Promise<Response> {
+  const id = nextRequestId();
+  if (debugEnabled) {
+    debug(id, `entry method=${req.method} url=${new URL(req.url).pathname}`);
+    debug(
+      id,
+      `req.signal.aborted=${req.signal?.aborted ?? "no-signal"} reason=${JSON.stringify(req.signal?.reason)}`
+    );
+  }
+
   // 1. Parse + validate.
   let raw: unknown;
   try {
@@ -56,7 +66,7 @@ async function handleChat(req: Request): Promise<Response> {
 
   const unsupported = findUnsupportedFields(raw);
   if (unsupported.length > 0) {
-    console.warn(`[chat] ignoring unsupported fields: ${unsupported.join(", ")}`);
+    console.warn(`[${id}] ignoring unsupported fields: ${unsupported.join(", ")}`);
   }
 
   const parsed = ChatRequestSchema.safeParse(raw);
@@ -69,16 +79,21 @@ async function handleChat(req: Request): Promise<Response> {
   }
   const body = parsed.data;
 
+  if (debugEnabled) {
+    debug(id, `parsed model=${body.model} stream=${body.stream} messages=${body.messages.length}`);
+  }
+
   // 2. Dispatch.
   if (body.stream) {
-    return streamChat(body, req.signal);
+    return streamChat(body, req.signal, id);
   }
-  return await nonStreamChat(body, req.signal);
+  return await nonStreamChat(body, req.signal, id);
 }
 
 async function nonStreamChat(
   body: Parameters<typeof ChatRequestSchema.parse>[0],
-  signal: AbortSignal | undefined
+  signal: AbortSignal | undefined,
+  id: string
 ): Promise<Response> {
   const validated = ChatRequestSchema.parse(body);
   let assistantMessage: unknown = null;
@@ -97,7 +112,8 @@ async function nonStreamChat(
       }
     }
   } catch (err) {
-    console.error("[chat] non-stream error:", err);
+    debug(id, `non-stream error (signal.aborted=${signal?.aborted}):`, err);
+    console.error(`[${id}] non-stream error:`, err);
     return jsonError(
       err instanceof Error ? err.message : String(err),
       "server_error",
@@ -128,15 +144,29 @@ async function nonStreamChat(
 
 function streamChat(
   body: Parameters<typeof ChatRequestSchema.parse>[0],
-  signal: AbortSignal | undefined
+  signal: AbortSignal | undefined,
+  id: string
 ): Response {
   const validated = ChatRequestSchema.parse(body);
   const state = newStreamingState(validated.model);
+
+  if (debugEnabled) {
+    debug(
+      id,
+      `entering streamChat: signal.aborted=${signal?.aborted} reason=${JSON.stringify(signal?.reason)}`
+    );
+  }
+
+  let heartbeatCount = 0;
+  let lastChunkAt = Date.now();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const encoder = new TextEncoder();
       const write = (s: string) => controller.enqueue(encoder.encode(s));
+      const markChunk = () => {
+        lastChunkAt = Date.now();
+      };
       const close = () => {
         try {
           controller.close();
@@ -152,8 +182,13 @@ function streamChat(
       // (lines starting with `:` are ignored by OpenAI clients and SSE
       // parsers) every 15s while we're still buffering the upstream messages.
       const heartbeat = setInterval(() => {
+        heartbeatCount += 1;
         try {
           write(": keep-alive\n\n");
+          debug(
+            id,
+            `heartbeat #${heartbeatCount} Δt=${Date.now() - lastChunkAt}ms`
+          );
         } catch {
           // controller already closed; that's fine, the timer just needs to stop
         }
@@ -168,9 +203,15 @@ function streamChat(
       try {
         for await (const msg of proxyChatCompletion(validated, signal)) {
           messages.push(msg);
+          markChunk();
         }
       } catch (err) {
-        console.error("[chat] stream error:", err);
+        debug(
+          id,
+          `stream error after ${heartbeatCount} heartbeats, signal.aborted=${signal?.aborted}, signal.reason=${JSON.stringify(signal?.reason)}:`,
+          err
+        );
+        console.error(`[${id}] stream error:`, err);
         const errPayload: OpenAIError = {
           error: {
             message: err instanceof Error ? err.message : String(err),
@@ -181,6 +222,7 @@ function streamChat(
         };
         try {
           write(`event: error\ndata: ${JSON.stringify(errPayload)}\n\n`);
+          markChunk();
         } catch {
           // controller may already be closed if the client disconnected
         }
@@ -205,21 +247,31 @@ function streamChat(
       // interleaved `assistant` snapshot when state.emittedRole is true.
       for (const msg of messages) {
         const chunk = ndjsonToChunk(msg, state);
-        if (chunk) write(sseEncode(chunk));
+        if (chunk) {
+          write(sseEncode(chunk));
+          markChunk();
+        }
       }
 
       write(sseDone());
+      markChunk();
+      debug(
+        id,
+        `stream done: ${messages.length} upstream msgs, ${heartbeatCount} heartbeats`
+      );
       close();
     },
   });
 
+  const responseHeaders = {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  };
+  if (debugEnabled) debug(id, `responding 200 with SSE headers: ${JSON.stringify(responseHeaders)}`);
   return new Response(stream, {
     status: 200,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
+    headers: responseHeaders,
   });
 }
 
@@ -267,3 +319,4 @@ console.log(`  GET  /healthz                  (open)`);
 console.log(`  GET  /v1/models                (auth required)`);
 console.log(`  POST /v1/chat/completions      (auth required)`);
 console.log(`  auth: ${tokens.size} token(s) loaded from PUKU_PROXY_AUTH_KEYS`);
+console.log(`  debug: ${debugEnabled ? "on (PUKU_PROXY_DEBUG set)" : "off"}`);
