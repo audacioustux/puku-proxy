@@ -26,18 +26,7 @@ import {
 } from "./translate.ts";
 import { healthResponse } from "./health.ts";
 import { loadAuthTokens, verifyRequest } from "./auth.ts";
-
-// ---- Model list (hardcoded; SDK has no list-models API) ----
-
-const MODEL_LIST = {
-  object: "list",
-  data: [
-    { id: "puku-default", object: "model", created: 0, owned_by: "puku" },
-    { id: "puku-fast", object: "model", created: 0, owned_by: "puku" },
-    { id: "opus", object: "model", created: 0, owned_by: "puku" },
-    { id: "sonnet", object: "model", created: 0, owned_by: "puku" },
-  ],
-};
+import { getModelList, startModelListRefresh } from "./models.ts";
 
 // ---- Helpers ----
 
@@ -53,7 +42,7 @@ function jsonOk<T>(body: T, status = 200): Response {
 // ---- Route handlers ----
 
 async function handleModels(): Promise<Response> {
-  return jsonOk(MODEL_LIST);
+  return jsonOk(getModelList());
 }
 
 async function handleChat(req: Request): Promise<Response> {
@@ -220,6 +209,11 @@ const port = Number(process.env.PORT ?? 8787);
 
 // Load tokens at startup. Fails closed — proxy refuses to run without auth.
 const tokens = loadAuthTokens();
+
+// Start the model-list refresher before binding the port. The first fetch is
+// awaited inside, so by the time the server is reachable we have either a
+// fresh live list or the hardcoded fallback (logged either way).
+await startModelListRefresh();
 
 const server = Bun.serve({
   port,
