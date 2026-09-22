@@ -145,6 +145,20 @@ function streamChat(
         }
       };
 
+      // SSE keep-alive: puku-cli can take 10-30s to produce its first token,
+      // during which the SSE stream has nothing to send. Traefik / Dokploy's
+      // edge will close the connection on its idle timeout (default ~30s),
+      // killing the request before any data flows. Emit an SSE comment
+      // (lines starting with `:` are ignored by OpenAI clients and SSE
+      // parsers) every 15s while we're still buffering the upstream messages.
+      const heartbeat = setInterval(() => {
+        try {
+          write(": keep-alive\n\n");
+        } catch {
+          // controller already closed; that's fine, the timer just needs to stop
+        }
+      }, 15_000);
+
       // Collect every NDJSON message before emitting. We need the full stream
       // because (a) the `result` message carries usage and arrives after
       // `message_stop`, and (b) the `assistant` snapshot is interleaved with
@@ -165,10 +179,16 @@ function streamChat(
             code: null,
           },
         };
-        write(`event: error\ndata: ${JSON.stringify(errPayload)}\n\n`);
+        try {
+          write(`event: error\ndata: ${JSON.stringify(errPayload)}\n\n`);
+        } catch {
+          // controller may already be closed if the client disconnected
+        }
+        clearInterval(heartbeat);
         close();
         return;
       }
+      clearInterval(heartbeat);
 
       // First pass: pull usage from `result` so the close-out chunk can carry
       // it. We don't emit yet.
