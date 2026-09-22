@@ -3,30 +3,28 @@
 # Multi-stage build for puku-proxy.
 #
 # Stage 1 (oven/bun:1.4.2): install deps and bundle the source.
-# Stage 2 (oven/bun:1.4.2-debian): runtime image with build-essential +
-# puku-cli installed via bun (oven/bun images ship no npm/node, so `bun
-# add -g` is the only path). puku-cli is an ESM script with
-# `#!/usr/bin/env node` shebang; we rewrite it to bun and disable
-# puku-cli's Node-only heap re-exec via PUKU_CLI_DISABLE_HEAP_RELAUNCH=1.
-#
-# puku-cli transitively pulls better-sqlite3@12.9.0, which has a native
-# binding that Bun's prebuilt picker can't satisfy (target=node, not
-# bun), so node-gyp falls back to compiling from source. That requires
-# a C/C++ toolchain + python3 — both present on -debian, but only
-# python3 is preinstalled, so we apt-get install build-essential here.
-# Final image ~400MB; trim when puku-cli drops the SQLite dep.
+# Stage 2 (node:22-bookworm-slim): runtime image. We need BOTH Node and Bun:
+#   - puku-cli is a Node script with a hard `better-sqlite3` native dep.
+#     The prebuilt binary is published for Node ABI only; Bun refuses to
+#     load it (`'better-sqlite3' is not yet supported in Bun`, see
+#     oven-sh/bun#4290). So puku-cli must run under real Node.
+#   - The proxy uses Bun.serve — Bun-only. So the proxy must run under Bun.
+# `npm install -g @puku/puku-cli` works because npm's prebuild-install
+# resolves the prebuilt better-sqlite3 binary for the Node ABI, with no
+# native compile required (and no build-essential in the image).
 #
 # We use `bun build --target=bun` rather than `--compile` because puku-agent-sdk
 # pulls in @sentry/bun, which is a real Node package — compile-time bundling
 # occasionally mishandles such peers, and we want a known-good runtime.
 
 ARG BUN_VERSION=1.4.2
-# CACHEBUST 2026-09-22T15:30Z — bump this comment to invalidate BuildKit layer
+ARG NODE_VERSION=22.12.0
+# CACHEBUST 2026-09-22T17:30Z — bump this comment to invalidate BuildKit layer
 # cache for the runtime stage after the runtime base image changes. Without
 # this, Dokploy's buildkit can replay a cached layer that succeeded/failed with
 # the previous base image. The comment itself isn't executed; it just makes
 # the file change so the cache key changes.
-ARG CACHEBUST=run-2026-09-22T15-30Z
+ARG CACHEBUST=run-2026-09-22T17-30Z
 
 # ---- Build stage ----
 FROM oven/bun:${BUN_VERSION} AS build
@@ -47,61 +45,68 @@ RUN bun build src/server.ts --target=bun --outfile=dist/server.js
 RUN bun install --production --frozen-lockfile
 
 # ---- Runtime stage ----
-# oven/bun:1.4.2-debian ships python3 (for node-gyp) but no C/C++ toolchain.
-# puku-cli@1.8.56 transitively pulls better-sqlite3@12.9.0, which has a
-# native binding that needs to compile from source — node-gyp finds Python
-# (good) but then fails to find a compiler. Install build-essential here.
-# This is a one-time build-time cost; the toolchain persists in the final
-# image (~+250MB). When Bun ships a better-sqlite3 replacement or puku-cli
-# drops the dep, swap back to oven/bun:1.4.2-slim and drop this layer.
-FROM oven/bun:${BUN_VERSION}-debian AS runtime
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+
+# Install Bun (needed for `Bun.serve` in the proxy). Download the official
+# release tarball, verify the SHA, and lay it down at /usr/local/bin/bun.
+# (The `curl | bash` install script is blocked by some sandboxes; we use the
+# direct tarball approach instead.)
+ARG BUN_VERSION
+ARG CACHEBUST=run-2026-09-22T17-30Z
+ARG TARGETARCH
 
 # Re-declare CACHEBUST inside this stage (global ARGs go out of scope after
 # each FROM). The value is forwarded via `--build-arg CACHEBUST=...` from
-# compose.yml, or defaults to the dated sentinel baked in at line 21.
-ARG CACHEBUST=run-2026-09-22T15-30Z
-
-# Force a layer cache miss for everything below by referencing CACHEBUST.
-# The empty echo runs once and changes the layer hash. Bump the value of
-# CACHEBUST (in compose.yml's `args:` block, or in the default above) to
-# invalidate downstream layers after a runtime base image change.
+# compose.yml, or defaults to the dated sentinel baked in above.
 RUN echo "puku-proxy runtime cachebust: ${CACHEBUST}" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends curl ca-certificates unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && cd /tmp \
+    && curl -fsSL -o bun.zip \
+         "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${TARGETARCH:-x64}.zip" \
+    && unzip -o bun.zip \
+    && mv bun-linux-*/bun /usr/local/bin/bun \
+    && rm -rf bun.zip bun-linux-* \
+    && chmod +x /usr/local/bin/bun \
+    && bun --version
 
-# puku-cli is the upstream CLI spawned by puku-agent-sdk. It ships as a
-# Node script (`#!/usr/bin/env node`) but uses only Node APIs that Bun
-# implements (fs/path/url/child_process). Install via `bun add -g` (npm
-# isn't available in oven/bun images), rewrite the shebang to bun, and
-# disable puku-cli's Node-only heap re-exec. better-sqlite3 compiles here
-# using the build-essential + python3 we just installed.
-#
-# Run as `bun` user so the global bin dir (default $HOME/.bun/bin) lands
-# in the same user's home — and stay as `bun` for the rest of the image.
-ENV PUKU_CLI_DISABLE_HEAP_RELAUNCH=1
+# puku-cli is the upstream CLI spawned by puku-agent-sdk. It's a Node script
+# that requires `better-sqlite3` as a hard runtime dep — the prebuilt binary
+# is published for Node ABI only. `npm install -g` resolves the prebuilt in
+# ~1 minute (no native compile, no build-essential). Set
+# PUKU_CLI_DISABLE_HEAP_RELAUNCH=1 to skip puku-cli's Node heap re-exec
+# (injects --max-old-space-size / --expose-gc, which are no-ops under Bun's
+# runtime anyway — we want puku-cli running under Node straight).
+ENV PUKU_CLI_DISABLE_HEAP_RELAUNCH=1 \
+    PUPPETEER_SKIP_DOWNLOAD=true
 
-USER bun
-ENV HOME=/home/bun
-RUN bun add -g @puku/puku-cli@1.8.56 \
-    && CLI="$HOME/.bun/bin/puku-cli" \
-    && sed -i '1s|.*|#!/usr/bin/env bun|' "$CLI" \
-    && head -1 "$CLI" \
-    && "$CLI" --version
+# npm installs as root by default; the `node` user (uid 1000) gets a clean
+# home at /home/node. We chown the global install dir + the puku-cli bin
+# symlink so USER node picks them up off PATH later. We don't chown the
+# rest of /usr/local/bin to avoid touching unrelated root-owned files.
+RUN npm install -g @puku/puku-cli@1.8.56 \
+    && which puku-cli \
+    && puku-cli --version \
+    && head -1 "$(which puku-cli)" \
+    && chown -R node:node /usr/local/lib/node_modules \
+    && chown -R node:node /usr/local/bin/bun \
+    && chown node:node /usr/local/bin/puku-cli /usr/local/bin/npm /usr/local/bin/npx
 
 WORKDIR /app
 
 # Copy bundled source + production node_modules from the build stage, owned
-# by the `bun` user so subsequent USER bun can write here if needed.
-COPY --from=build --chown=bun:bun /app/dist ./dist
-COPY --from=build --chown=bun:bun /app/node_modules ./node_modules
-COPY --from=build --chown=bun:bun /app/package.json ./
+# by the `node` user so the runtime process can read them.
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/package.json ./
 
-# ~/.bun/bin is on PATH for the bun user — confirmed by `head -1` above
-# resolving the rewritten shebang to bun.
+USER node
+
 ENV NODE_ENV=production \
     PORT=8787 \
-    PATH="/home/bun/.bun/bin:${PATH}"
+    HOME=/home/node \
+    PATH="/usr/local/bin:${PATH}"
 
 EXPOSE 8787
 
