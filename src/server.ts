@@ -25,6 +25,7 @@ import {
   usageFromRecord,
 } from "./translate.ts";
 import { healthResponse } from "./health.ts";
+import { loadAuthTokens, verifyRequest } from "./auth.ts";
 
 // ---- Model list (hardcoded; SDK has no list-models API) ----
 
@@ -217,18 +218,26 @@ function streamChat(
 
 const port = Number(process.env.PORT ?? 8787);
 
+// Load tokens at startup. Fails closed — proxy refuses to run without auth.
+const tokens = loadAuthTokens();
+
 const server = Bun.serve({
   port,
   async fetch(req) {
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/healthz") {
+      // /healthz stays open — meant for orchestrator probes.
       return healthResponse();
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
+      const authErr = verifyRequest(req, tokens);
+      if (authErr) return authErr;
       return handleModels();
     }
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+      const authErr = verifyRequest(req, tokens);
+      if (authErr) return authErr;
       return handleChat(req);
     }
     return jsonError(`not found: ${req.method} ${url.pathname}`, "not_found_error", 404);
@@ -240,6 +249,7 @@ const server = Bun.serve({
 });
 
 console.log(`puku-proxy listening on http://localhost:${server.port}`);
-console.log(`  GET  /healthz`);
-console.log(`  GET  /v1/models`);
-console.log(`  POST /v1/chat/completions`);
+console.log(`  GET  /healthz                  (open)`);
+console.log(`  GET  /v1/models                (auth required)`);
+console.log(`  POST /v1/chat/completions      (auth required)`);
+console.log(`  auth: ${tokens.size} token(s) loaded from PUKU_PROXY_AUTH_KEYS`);

@@ -19,15 +19,41 @@ Server listens on `http://localhost:8787` by default. Override with `PORT=…`.
 
 ## Auth
 
-The proxy inherits auth from the environment, exactly as `puku-cli` does:
+### Proxy-level bearer auth (required)
+
+The proxy itself requires an `Authorization: Bearer <token>` header on every protected route (`/v1/models`, `/v1/chat/completions`). `/healthz` stays open for orchestrator probes.
+
+Configure accepted tokens via the `PUKU_PROXY_AUTH_KEYS` env var (comma-separated; supports multiple tokens for rotation):
+
+```bash
+export PUKU_PROXY_AUTH_KEYS=pk_live_2IEPGSh5e66T6Yzi0dnUtRN_b5dEHNq8ysiL1iSsTlQ
+bun start
+```
+
+The proxy refuses to start without this variable set — fail-closed.
+
+Then send it as a standard bearer header:
+
+```bash
+curl http://localhost:8787/v1/chat/completions \
+  -H "authorization: Bearer pk_live_..." \
+  -H 'content-type: application/json' \
+  -d '{"model":"puku-default","messages":[{"role":"user","content":"hi"}]}'
+```
+
+### Upstream auth (optional)
+
+The proxy inherits upstream auth from the environment, exactly as `puku-cli` does:
 
 | Variable           | Effect                                                                  |
 |--------------------|-------------------------------------------------------------------------|
-| `PUKU_AI_API_KEY`  | Primary API key. Set this for headless / CI usage.                      |
+| `PUKU_AI_API_KEY`  | Primary upstream API key. Set this for headless / CI usage.             |
 | `PUKU_AUTH_TOKEN`  | OAuth bearer. Alternative to API key.                                   |
 | `PUKU_BASE_URL`    | Override the SDK gateway URL (defaults to `https://agent.sdk.puku.sh`). |
 
 If none of these are set, the proxy falls back to whatever `puku-cli auth login` has stored in the keychain, or its anonymous default routing. You can `puku-cli auth login` interactively once and the proxy will pick it up.
+
+Note: upstream auth and proxy-level auth are independent. A valid `PUKU_PROXY_AUTH_KEYS` token is required to reach the proxy at all; the upstream `PUKU_AI_API_KEY` controls which models the proxy can call once you're in.
 
 ## Endpoints
 
