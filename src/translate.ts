@@ -92,8 +92,14 @@ export interface StreamingState {
   created: number;
   /** Set to true once we've emitted the role-only chunk. */
   emittedRole: boolean;
-  /** Set once we've emitted the final close-out chunk + [DONE]. */
+  /** Set once the terminal chunk has been emitted. Guards double close-out. */
   closed: boolean;
+  /**
+   * Set when upstream signalled end-of-generation (message_stop or result).
+   * Distinct from `closed`: the terminal chunk is deferred until the upstream
+   * iterable is exhausted so late-arriving `result` usage is included.
+   */
+  sawStop: boolean;
   /** Accumulated usage from message_delta + result. */
   usage?: OpenAIUsage;
   /** Finish reason captured from message_delta. */
@@ -107,6 +113,7 @@ export function newStreamingState(model: string): StreamingState {
     created: Math.floor(Date.now() / 1000),
     emittedRole: false,
     closed: false,
+    sawStop: false,
     finishReason: null,
   };
 }
@@ -232,15 +239,12 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
     }
 
     if (ev.type === "message_stop") {
-      // A `result` message arriving first already closed the stream; emitting
-      // again would send two finish_reason chunks, which strict clients reject.
-      if (state.closed) return null;
-      const close = baseChunk(state, [
-        { index: 0, delta: {}, finish_reason: state.finishReason ?? "stop" },
-      ]);
-      if (state.usage) close.usage = state.usage;
-      state.closed = true;
-      return close;
+      // Record the end of generation but do NOT emit yet. `result` carries the
+      // authoritative usage and can arrive after this message; emitting here
+      // would strand those counts. `finalChunk()` flushes exactly one
+      // terminal chunk once the upstream iterable is exhausted.
+      state.sawStop = true;
+      return null;
     }
 
     // content_block_start / content_block_stop / ping / unknown — skip.
@@ -274,24 +278,54 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
   }
 
   if (isResultMessage(m)) {
-    // `result` carries the authoritative token counts, and it can arrive
-    // either side of message_stop. Absorb its usage FIRST, unconditionally —
-    // returning early on an already-closed stream would discard it and leave
-    // the caller with whatever partial numbers a message_delta reported.
+    // `result` carries the authoritative token counts. Absorb them and mark
+    // the generation ended; the terminal chunk is emitted by `finalChunk()`.
     if (m.usage) state.usage = mergeUsage(state.usage, m.usage);
-    if (state.closed) return null;
-    state.closed = true;
-    const close = baseChunk(state, [
-      { index: 0, delta: {}, finish_reason: state.finishReason ?? "stop" },
-    ]);
-    // Same contract as the message_stop close-out: the terminating chunk
-    // carries usage. Omitting it here stranded the counts whenever `result`
-    // was the message that closed the stream.
-    if (state.usage) close.usage = state.usage;
-    return close;
+    state.sawStop = true;
+    return null;
   }
 
   return null;
+}
+
+/**
+ * Translate an upstream NDJSON stream into OpenAI chunks, terminal chunk
+ * included.
+ *
+ * This is the API production callers should use: it owns the full lifecycle, so
+ * there is no way to consume the stream and forget the terminal chunk. The
+ * terminal chunk is deliberately emitted after the upstream iterable is
+ * exhausted rather than on `message_stop`, because `result` carries the
+ * authoritative token counts and may arrive afterwards.
+ */
+export async function* translateStream(
+  upstream: AsyncIterable<unknown>,
+  state: StreamingState
+): AsyncIterable<OpenAIChunk> {
+  for await (const msg of upstream) {
+    const chunk = ndjsonToChunk(msg, state);
+    if (chunk) yield chunk;
+  }
+  const terminal = finalChunk(state);
+  if (terminal) yield terminal;
+}
+
+/**
+ * Emit the single terminal chunk, or null if one was already emitted.
+ *
+ * Called once after the upstream iterable is exhausted. Deferring to here is
+ * what lets `result` usage arriving after `message_stop` reach the client:
+ * the terminal chunk is built from final state, not from whichever message
+ * happened to signal the end.
+ */
+export function finalChunk(state: StreamingState): OpenAIChunk | null {
+  if (state.closed) return null;
+  state.closed = true;
+  const close = baseChunk(state, [
+    { index: 0, delta: {}, finish_reason: state.finishReason ?? "stop" },
+  ]);
+  if (state.usage) close.usage = state.usage;
+  return close;
 }
 
 export function isStreamClosed(state: StreamingState): boolean {

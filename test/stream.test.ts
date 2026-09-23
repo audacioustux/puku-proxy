@@ -185,6 +185,73 @@ describe("stream termination", () => {
  });
 });
 
+describe("usage reporting across upstream orderings", () => {
+ // `result` carries the authoritative token counts and may arrive either
+ // side of message_stop. A client's billing must not depend on which.
+ const bothOrderings: [string, () => AsyncIterable<unknown>][] = [
+  [
+   "result after message_stop",
+   async function* () {
+    yield startMsg;
+    yield deltaMsg("hi");
+    yield stopMsg;
+    yield resultMsg(2);
+   },
+  ],
+  [
+   "result before message_stop",
+   async function* () {
+    yield startMsg;
+    yield deltaMsg("hi");
+    yield resultMsg(2);
+    yield stopMsg;
+   },
+  ],
+ ];
+
+ for (const [label, upstream] of bothOrderings) {
+  test(`usage rides the final pre-[DONE] frame: ${label}`, async () => {
+   const frames = await readFrames(
+    streamChat(request, undefined, "u1", () => upstream()),
+   );
+   expect(frames[frames.length - 1]!.body).toBe("data: [DONE]\n\n");
+   const terminal = JSON.parse(frames[frames.length - 2]!.body.slice(6));
+   expect(terminal.usage).toEqual({
+    prompt_tokens: 10,
+    completion_tokens: 2,
+    total_tokens: 12,
+   });
+   expect(terminal.choices[0].finish_reason).toBe("stop");
+  });
+ }
+
+ test("still terminates cleanly when upstream sends no result at all", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "u2", async function* () {
+    yield startMsg;
+    yield deltaMsg("hi");
+    yield stopMsg;
+   }),
+  );
+  expect(frames[frames.length - 1]!.body).toBe("data: [DONE]\n\n");
+  const terminal = JSON.parse(frames[frames.length - 2]!.body.slice(6));
+  expect(terminal.choices[0].finish_reason).toBe("stop");
+ });
+
+ test("exactly one frame carries a finish_reason in either ordering", async () => {
+  for (const [, upstream] of bothOrderings) {
+   const frames = await readFrames(
+    streamChat(request, undefined, "u3", () => upstream()),
+   );
+   const closing = dataFrames(frames).filter((f) => {
+    if (f.body.includes("[DONE]")) return false;
+    return JSON.parse(f.body.slice(6)).choices[0].finish_reason != null;
+   });
+   expect(closing).toHaveLength(1);
+  }
+ });
+});
+
 describe("wire format", () => {
  test("every frame is a well-formed SSE data event", async () => {
   const frames = await readFrames(

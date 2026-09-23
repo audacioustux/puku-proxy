@@ -19,7 +19,7 @@ import {
 } from "./openai.ts";
 import {
   assistantToCompletion,
-  ndjsonToChunk,
+  translateStream,
   newStreamingState,
   sseDone,
   sseEncode,
@@ -219,9 +219,8 @@ export function streamChat(
       // `stream: true` — the client saw one burst after the full generation.
       let emitted = 0;
       try {
-        for await (const msg of upstream(validated, signal)) {
-          const chunk = ndjsonToChunk(msg, state);
-          if (!chunk) continue;
+        // translateStream owns the terminal chunk, so it cannot be skipped.
+        for await (const chunk of translateStream(upstream(validated, signal), state)) {
           write(sseEncode(chunk));
           markChunk();
           emitted += 1;
