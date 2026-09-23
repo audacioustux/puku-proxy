@@ -42,10 +42,27 @@ export async function* proxyChatCompletion(
  * the puku agent sees the prior tool-call output as part of the conversation
  * even though it can't act on it (maxTurns: 1).
  */
+/**
+ * Neutralise role-block boundaries in caller-supplied text.
+ *
+ * The prompt is a sequence of `<role>`…`</role>` blocks, so any `<` in
+ * message content could otherwise open or close a block and forge a
+ * system-authored instruction. Replacing `<` with the HTML entity keeps the
+ * text human- and model-readable (a model reads `&lt;` as a less-than sign)
+ * while making a forged tag impossible to express.
+ *
+ * Only `<` is escaped: `>` cannot start a tag, and leaving it alone keeps
+ * prose and code far more legible. `&` is escaped first so the entity we
+ * introduce is itself unambiguous.
+ */
+function escapeRoleDelimiters(text: string): string {
+  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;");
+}
+
 export function messagesToPrompt(messages: ChatRequest["messages"]): string {
   const lines: string[] = [];
   for (const m of messages) {
-    const text = contentToText(m.content).trim();
+    const text = escapeRoleDelimiters(contentToText(m.content).trim());
     const role = m.role;
     const tag = role; // system/user/assistant/tool/function
     if (text) {

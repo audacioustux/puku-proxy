@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "bun run --watch src/server.ts",
     "start": "bun src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test"
   },
   "dependencies": {
     "puku-agent-sdk": "^3.1.4",

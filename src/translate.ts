@@ -144,6 +144,25 @@ function mapStopReason(reason: string | null | undefined): "stop" | "length" | "
   }
 }
 
+/**
+ * Fold an upstream usage record into whatever we already know. Upstream
+ * reports usage across several messages (message_delta, result) and each may
+ * carry only part of the picture, so a later partial report must not erase an
+ * earlier complete one. Non-positive fields are treated as "not reported".
+ */
+function mergeUsage(
+  prev: OpenAIUsage | undefined,
+  raw: Record<string, number>
+): OpenAIUsage | undefined {
+  const next = usageFromRecord(raw);
+  if (!next) return prev;
+  if (!prev) return next;
+  const prompt_tokens = next.prompt_tokens > 0 ? next.prompt_tokens : prev.prompt_tokens;
+  const completion_tokens =
+    next.completion_tokens > 0 ? next.completion_tokens : prev.completion_tokens;
+  return { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
+}
+
 export function usageFromRecord(usage: Record<string, number> | undefined): OpenAIUsage | undefined {
   if (!usage) return undefined;
   const input = usage["input_tokens"] ?? 0;
@@ -175,7 +194,9 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
       // First chunk: role-only.
       state.emittedRole = true;
       if (ev.message?.id) state.id = "chatcmpl-" + (ev.message.id.slice(0, 24));
-      if (ev.message?.model) state.model = ev.message.model;
+      // Deliberately NOT adopting ev.message.model: OpenAI clients pin and
+      // assert on `model`, so it must stay the id the caller requested.
+      // Adopting the upstream name also leaks which vendor model served it.
       return baseChunk(state, [
         { index: 0, delta: { role: "assistant" }, finish_reason: null },
       ]);
@@ -202,14 +223,18 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
         state.finishReason = mapStopReason(ev.delta.stop_reason);
       }
       if (ev.delta?.usage) {
-        const u = usageFromRecord(ev.delta.usage);
-        if (u) state.usage = u;
+        // Merge, never replace. Anthropic-shaped message_delta.usage carries
+        // only output_tokens; a wholesale assignment would default
+        // input_tokens to 0 and silently under-report prompt_tokens.
+        state.usage = mergeUsage(state.usage, ev.delta.usage);
       }
       return null;
     }
 
     if (ev.type === "message_stop") {
-      // Emit close-out chunk + caller appends [DONE].
+      // A `result` message arriving first already closed the stream; emitting
+      // again would send two finish_reason chunks, which strict clients reject.
+      if (state.closed) return null;
       const close = baseChunk(state, [
         { index: 0, delta: {}, finish_reason: state.finishReason ?? "stop" },
       ]);
@@ -249,14 +274,21 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
   }
 
   if (isResultMessage(m)) {
-    // If message_stop never arrived (error paths), close out here.
+    // `result` carries the authoritative token counts, and it can arrive
+    // either side of message_stop. Absorb its usage FIRST, unconditionally —
+    // returning early on an already-closed stream would discard it and leave
+    // the caller with whatever partial numbers a message_delta reported.
+    if (m.usage) state.usage = mergeUsage(state.usage, m.usage);
     if (state.closed) return null;
-    const u = usageFromRecord(m.usage);
-    if (u) state.usage = u;
     state.closed = true;
-    return baseChunk(state, [
+    const close = baseChunk(state, [
       { index: 0, delta: {}, finish_reason: state.finishReason ?? "stop" },
     ]);
+    // Same contract as the message_stop close-out: the terminating chunk
+    // carries usage. Omitting it here stranded the counts whenever `result`
+    // was the message that closed the stream.
+    if (state.usage) close.usage = state.usage;
+    return close;
   }
 
   return null;

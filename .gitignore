@@ -6,3 +6,6 @@ node_modules/
 dist/
 .vscode/
 .idea/
+
+# Audit report — operational detail, never commit to a public repo
+AUDIT.md

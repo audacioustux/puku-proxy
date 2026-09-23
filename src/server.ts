@@ -13,6 +13,7 @@ import { proxyChatCompletion } from "./proxy.ts";
 import {
   ChatRequestSchema,
   findUnsupportedFields,
+  type ChatRequest,
   type OpenAICompletion,
   type OpenAIError,
 } from "./openai.ts";
@@ -28,6 +29,13 @@ import { healthResponse } from "./health.ts";
 import { loadAuthTokens, verifyRequest } from "./auth.ts";
 import { getModelList, startModelListRefresh } from "./models.ts";
 import { debug, debugEnabled, nextRequestId } from "./debug.ts";
+
+/**
+ * Largest accepted request body. A long legitimate conversation is well under
+ * this; beyond it the caller is either misusing the API or probing for a way
+ * to burn upstream compute.
+ */
+const MAX_REQUEST_BODY_BYTES = 1_000_000;
 
 // ---- Helpers ----
 
@@ -142,10 +150,19 @@ async function nonStreamChat(
   return jsonOk(completion);
 }
 
-function streamChat(
+/**
+ * `upstream` is injectable purely as a test seam: it defaults to the real
+ * puku call, and a test can substitute a paced async iterable to assert that
+ * chunks leave this function as they arrive rather than in one batch.
+ */
+export function streamChat(
   body: Parameters<typeof ChatRequestSchema.parse>[0],
   signal: AbortSignal | undefined,
-  id: string
+  id: string,
+  upstream: (
+    req: ChatRequest,
+    signal: AbortSignal | undefined
+  ) => AsyncIterable<unknown> = proxyChatCompletion
 ): Response {
   const validated = ChatRequestSchema.parse(body);
   const state = newStreamingState(validated.model);
@@ -159,6 +176,7 @@ function streamChat(
 
   let heartbeatCount = 0;
   let lastChunkAt = Date.now();
+  const startedAt = Date.now();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -194,24 +212,32 @@ function streamChat(
         }
       }, 15_000);
 
-      // Collect every NDJSON message before emitting. We need the full stream
-      // because (a) the `result` message carries usage and arrives after
-      // `message_stop`, and (b) the `assistant` snapshot is interleaved with
-      // stream events. Buffering lets us emit one clean OpenAI-shaped chunk
-      // per logical event, with usage attached to the close-out.
-      const messages: unknown[] = [];
+      // Translate and emit each upstream message as it arrives. The
+      // translator is a state machine: it carries usage forward across
+      // messages and emits exactly one close-out, so nothing here needs the
+      // whole stream in hand. Buffering used to defeat the point of
+      // `stream: true` — the client saw one burst after the full generation.
+      let emitted = 0;
       try {
-        for await (const msg of proxyChatCompletion(validated, signal)) {
-          messages.push(msg);
+        for await (const msg of upstream(validated, signal)) {
+          const chunk = ndjsonToChunk(msg, state);
+          if (!chunk) continue;
+          write(sseEncode(chunk));
           markChunk();
+          emitted += 1;
+          if (emitted === 1) {
+            debug(id, `first chunk out after ${Date.now() - startedAt}ms`);
+          }
         }
       } catch (err) {
         debug(
           id,
-          `stream error after ${heartbeatCount} heartbeats, signal.aborted=${signal?.aborted}, signal.reason=${JSON.stringify(signal?.reason)}:`,
+          `stream error after ${heartbeatCount} heartbeats, ${emitted} chunks, signal.aborted=${signal?.aborted}, signal.reason=${JSON.stringify(signal?.reason)}:`,
           err
         );
         console.error(`[${id}] stream error:`, err);
+        // Surface the error as a normal data frame: the OpenAI SDKs only
+        // parse `data:`, so a bare `event: error` is invisible to them.
         const errPayload: OpenAIError = {
           error: {
             message: err instanceof Error ? err.message : String(err),
@@ -221,7 +247,10 @@ function streamChat(
           },
         };
         try {
-          write(`event: error\ndata: ${JSON.stringify(errPayload)}\n\n`);
+          write(sseEncode(errPayload));
+          // Always terminate the stream. Without [DONE] a waiting client
+          // hangs until its own timeout rather than surfacing the error.
+          write(sseDone());
           markChunk();
         } catch {
           // controller may already be closed if the client disconnected
@@ -232,32 +261,11 @@ function streamChat(
       }
       clearInterval(heartbeat);
 
-      // First pass: pull usage from `result` so the close-out chunk can carry
-      // it. We don't emit yet.
-      for (const msg of messages) {
-        if (typeof msg !== "object" || msg === null) continue;
-        const m = msg as { type?: string; usage?: Record<string, number> };
-        if (m.type === "result" && m.usage) {
-          const u = usageFromRecord(m.usage);
-          if (u) state.usage = u;
-        }
-      }
-
-      // Second pass: emit chunks. The translator already drops the
-      // interleaved `assistant` snapshot when state.emittedRole is true.
-      for (const msg of messages) {
-        const chunk = ndjsonToChunk(msg, state);
-        if (chunk) {
-          write(sseEncode(chunk));
-          markChunk();
-        }
-      }
-
       write(sseDone());
       markChunk();
       debug(
         id,
-        `stream done: ${messages.length} upstream msgs, ${heartbeatCount} heartbeats`
+        `stream done: ${emitted} chunks in ${Date.now() - startedAt}ms, ${heartbeatCount} heartbeats`
       );
       close();
     },
@@ -277,6 +285,7 @@ function streamChat(
 
 // ---- Server ----
 
+if (import.meta.main) {
 const port = Number(process.env.PORT ?? 8787);
 
 // Load tokens at startup. Fails closed — proxy refuses to run without auth.
@@ -289,6 +298,10 @@ await startModelListRefresh();
 
 const server = Bun.serve({
   port,
+  // Each chat request spawns a puku-cli subprocess, so an oversized prompt is
+  // an expensive request. Cap the body well below anything a legitimate
+  // conversation needs; Bun rejects larger payloads before we allocate them.
+  maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
   async fetch(req) {
     const url = new URL(req.url);
 
@@ -320,3 +333,4 @@ console.log(`  GET  /v1/models                (auth required)`);
 console.log(`  POST /v1/chat/completions      (auth required)`);
 console.log(`  auth: ${tokens.size} token(s) loaded from PUKU_PROXY_AUTH_KEYS`);
 console.log(`  debug: ${debugEnabled ? "on (PUKU_PROXY_DEBUG set)" : "off"}`);
+}
