@@ -95,6 +95,12 @@ export interface StreamingState {
   /** Set once the terminal chunk has been emitted. Guards double close-out. */
   closed: boolean;
   /**
+   * Set once any text content has been emitted, by either a delta or the
+   * assistant snapshot. `emittedRole` cannot serve this purpose: it is only
+   * set by message_start, which some upstream paths never send.
+   */
+  emittedText: boolean;
+  /**
    * Set when upstream signalled end-of-generation (message_stop or result).
    * Distinct from `closed`: the terminal chunk is deferred until the upstream
    * iterable is exhausted so late-arriving `result` usage is included.
@@ -112,6 +118,7 @@ export function newStreamingState(model: string): StreamingState {
     model,
     created: Math.floor(Date.now() / 1000),
     emittedRole: false,
+    emittedText: false,
     closed: false,
     sawStop: false,
     finishReason: null,
@@ -212,6 +219,7 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
     if (ev.type === "content_block_delta") {
       const d = ev.delta;
       if (d?.type === "text_delta" && typeof d.text === "string") {
+        state.emittedText = true;
         return baseChunk(state, [
           {
             index: typeof ev.index === "number" ? ev.index : 0,
@@ -256,25 +264,27 @@ export function ndjsonToChunk(msg: unknown, state: StreamingState): OpenAIChunk 
     // between `content_block_delta` and `content_block_stop` — it's a
     // transcript artifact, not new content. `message_stop` (handled above)
     // emits the close-out chunk with `finish_reason`, which is what clients
-    // expect. Drop `assistant` whenever we've already emitted at least one
-    // text delta OR we've entered the close-out sequence.
+    // expect. Key the check on whether TEXT has gone out, not on
+    // `emittedRole`: message_start is absent on some upstream paths, and
+    // keying on it let the snapshot duplicate text the deltas already sent.
     //
-    // The fallback path (includePartialMessages=false) hits this branch and
-    // does emit one chunk carrying the full text + role. That's the only
-    // case where we should act on it.
-    if (state.emittedRole || state.closed) return null;
+    // The fallback path (includePartialMessages=false) yields no deltas, so
+    // the snapshot is the real content and must be emitted.
+    if (state.emittedText || state.closed) return null;
     const text = extractText(m.message.content);
     state.emittedRole = true;
-    state.closed = true;
-    const chunk = baseChunk(state, [
+    state.emittedText = true;
+    // Record the finish reason but do NOT terminate here: `result` may still
+    // arrive with authoritative usage, and finalChunk() owns the close-out.
+    state.finishReason = mapStopReason(m.message.stop_reason);
+    state.sawStop = true;
+    return baseChunk(state, [
       {
         index: 0,
         delta: { role: "assistant", content: text },
-        finish_reason: mapStopReason(m.message.stop_reason),
+        finish_reason: null,
       },
     ]);
-    if (state.usage) chunk.usage = state.usage;
-    return chunk;
   }
 
   if (isResultMessage(m)) {
@@ -322,10 +332,28 @@ export function finalChunk(state: StreamingState): OpenAIChunk | null {
   if (state.closed) return null;
   state.closed = true;
   const close = baseChunk(state, [
-    { index: 0, delta: {}, finish_reason: state.finishReason ?? "stop" },
+    {
+      index: 0,
+      delta: {},
+      // Upstream never signalled end-of-generation: puku-cli can die
+      // mid-answer and still exit 0 (or be SIGKILLed), in which case the SDK
+      // yields no error and the iterable just ends. Claiming "stop" would
+      // tell the client a truncated answer completed normally, so leave
+      // finish_reason null and let the caller surface an error alongside it.
+      finish_reason: state.sawStop ? state.finishReason ?? "stop" : null,
+    },
   ]);
   if (state.usage) close.usage = state.usage;
   return close;
+}
+
+/**
+ * Whether upstream actually signalled end-of-generation. False means the
+ * stream was cut short and the caller should surface an error rather than
+ * presenting the partial answer as complete.
+ */
+export function streamWasTruncated(state: StreamingState): boolean {
+  return !state.sawStop;
 }
 
 export function isStreamClosed(state: StreamingState): boolean {

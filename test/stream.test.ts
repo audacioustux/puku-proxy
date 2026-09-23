@@ -138,6 +138,47 @@ describe("incremental delivery", () => {
  });
 });
 
+describe("truncated upstream", () => {
+ // puku-cli can die mid-generation and still exit 0 (or be SIGKILLed, e.g.
+ // OOM), in which case the SDK yields no error and the iterable simply ends
+ // with no message_stop and no result. Reporting that as finish_reason
+ // "stop" tells the client a cut-off answer completed normally, which is
+ // worse than an error: the caller acts on a truncated response.
+ async function* truncated(): AsyncIterable<unknown> {
+  yield startMsg;
+  yield deltaMsg("The answer is");
+ }
+
+ test("a silently truncated stream is not reported as a normal completion", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "x1", () => truncated()),
+  );
+  const terminal = JSON.parse(frames[frames.length - 2]!.body.slice(6));
+  expect(terminal.choices?.[0]?.finish_reason).not.toBe("stop");
+ });
+
+ test("a silently truncated stream surfaces an error to the client", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "x2", () => truncated()),
+  );
+  expect(frames.some((f) => f.body.includes('"error"'))).toBe(true);
+ });
+
+ test("a truncated stream still terminates with [DONE]", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "x3", () => truncated()),
+  );
+  expect(frames[frames.length - 1]!.body).toBe("data: [DONE]\n\n");
+ });
+
+ test("content emitted before truncation is preserved", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "x4", () => truncated()),
+  );
+  expect(frames.some((f) => f.body.includes("The answer is"))).toBe(true);
+ });
+});
+
 describe("stream termination", () => {
  test("a successful stream ends with [DONE]", async () => {
   const frames = await readFrames(

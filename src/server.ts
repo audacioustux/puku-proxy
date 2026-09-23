@@ -19,6 +19,7 @@ import {
 } from "./openai.ts";
 import {
   assistantToCompletion,
+  streamWasTruncated,
   translateStream,
   newStreamingState,
   sseDone,
@@ -259,6 +260,28 @@ export function streamChat(
         return;
       }
       clearInterval(heartbeat);
+
+      // Upstream ended without signalling end-of-generation, so whatever the
+      // client received is a partial answer. Surface it as an error rather
+      // than letting a truncated response look complete.
+      if (streamWasTruncated(state)) {
+        debug(id, `upstream truncated after ${emitted} chunks`);
+        console.error(`[${id}] upstream ended without message_stop or result`);
+        const truncPayload: OpenAIError = {
+          error: {
+            message: "upstream ended before completing the response",
+            type: "server_error",
+            param: null,
+            code: "incomplete_response",
+          },
+        };
+        try {
+          write(sseEncode(truncPayload));
+          markChunk();
+        } catch {
+          // controller may already be closed if the client disconnected
+        }
+      }
 
       write(sseDone());
       markChunk();

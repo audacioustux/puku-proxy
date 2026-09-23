@@ -228,6 +228,73 @@ describe("usage reporting", () => {
  });
 });
 
+// ---- Truncated upstream ----
+
+describe("truncated upstream", () => {
+ // Asserted at the translator level, not just through streamChat: the server
+ // writes its own error frame on truncation, which would mask a translator
+ // that fabricates finish_reason "stop" here.
+ test("the terminal chunk does not claim a normal stop", async () => {
+  const { chunks } = await drive([start(), textDelta("The answer is")]);
+  const terminal = chunks[chunks.length - 1];
+  expect(terminal?.choices[0]?.finish_reason).toBeNull();
+ });
+
+ test("a genuine message_stop still yields finish_reason stop", async () => {
+  const { chunks } = await drive([start(), textDelta("done"), messageStop()]);
+  const terminal = chunks[chunks.length - 1];
+  expect(terminal?.choices[0]?.finish_reason).toBe("stop");
+ });
+
+ test("a result-only ending still yields finish_reason stop", async () => {
+  const { chunks } = await drive([start(), textDelta("done"), result()]);
+  const terminal = chunks[chunks.length - 1];
+  expect(terminal?.choices[0]?.finish_reason).toBe("stop");
+ });
+});
+
+// ---- Assistant snapshot deduplication ----
+
+describe("assistant snapshot", () => {
+ // The SDK interleaves a full-text `assistant` snapshot alongside the
+ // incremental deltas. It is a transcript artifact, not new content, so it
+ // must never be emitted when deltas already carried the same text —
+ // including when no message_start arrived to set emittedRole.
+ test("does not duplicate text already sent as deltas", async () => {
+  const { chunks } = await drive([
+   textDelta("Hello world"),
+   assistant("Hello world"),
+   messageStop(),
+   result({ input_tokens: 50, output_tokens: 2 }),
+  ]);
+  const text = chunks.map((c) => c.choices[0]?.delta?.content ?? "").join("");
+  expect(text).toBe("Hello world");
+ });
+
+ test("usage still reaches the terminal chunk without message_start", async () => {
+  const { chunks } = await drive([
+   textDelta("Hello world"),
+   assistant("Hello world"),
+   messageStop(),
+   result({ input_tokens: 50, output_tokens: 2 }),
+  ]);
+  const terminal = chunks[chunks.length - 1];
+  expect(terminal?.usage).toEqual({
+   prompt_tokens: 50,
+   completion_tokens: 2,
+   total_tokens: 52,
+  });
+ });
+
+ test("is still emitted when it is the only source of text", async () => {
+  // Fallback path: includePartialMessages=false yields no deltas at all, so
+  // the snapshot is the real content and must survive.
+  const { chunks } = await drive([assistant("Only source"), result()]);
+  const text = chunks.map((c) => c.choices[0]?.delta?.content ?? "").join("");
+  expect(text).toBe("Only source");
+ });
+});
+
 // ---- Content fidelity ----
 
 describe("content fidelity", () => {
