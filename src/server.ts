@@ -32,11 +32,27 @@ import { getModelList, startModelListRefresh } from "./models.ts";
 import { debug, debugEnabled, nextRequestId } from "./debug.ts";
 
 /**
- * Largest accepted request body. A long legitimate conversation is well under
- * this; beyond it the caller is either misusing the API or probing for a way
- * to burn upstream compute.
+ * Largest accepted request body, in bytes. Override with
+ * `PUKU_PROXY_MAX_BODY_BYTES`.
+ *
+ * Each chat request spawns a puku-cli subprocess, so an oversized prompt is an
+ * expensive request and worth bounding. The default is 5MB: agent traffic
+ * carrying long tool-call histories is legitimately large — production logs
+ * show conversations of 175 messages — and rejecting those is worse than
+ * serving them. Tune it rather than removing it.
  */
-const MAX_REQUEST_BODY_BYTES = 1_000_000;
+const MAX_REQUEST_BODY_BYTES = (() => {
+  const raw = process.env["PUKU_PROXY_MAX_BODY_BYTES"];
+  if (!raw) return 5_000_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(
+      `[config] PUKU_PROXY_MAX_BODY_BYTES="${raw}" is not a positive number; using 5000000`
+    );
+    return 5_000_000;
+  }
+  return parsed;
+})();
 
 // ---- Helpers ----
 
@@ -121,7 +137,8 @@ export async function handleChat(req: Request): Promise<Response> {
     const mb = (bodyText.length / 1_000_000).toFixed(1);
     logRequest(id, req, 413, startedAt, `body ${mb}MB exceeds limit`);
     return jsonError(
-      `request body is ${mb}MB, which exceeds the ${MAX_REQUEST_BODY_BYTES / 1_000_000}MB limit`,
+      `request body is ${mb}MB, which exceeds the ${(MAX_REQUEST_BODY_BYTES / 1_000_000).toFixed(1)}MB limit ` +
+        `(raise PUKU_PROXY_MAX_BODY_BYTES to allow larger requests)`,
       "invalid_request_error",
       413
     );
