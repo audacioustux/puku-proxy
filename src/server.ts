@@ -63,14 +63,38 @@ function isClientDisconnect(err: unknown, signal: AbortSignal | undefined): bool
   return err instanceof Error && err.name === "AbortError";
 }
 
+/**
+ * One line per completed request, always emitted.
+ *
+ * Previously only `/v1/chat/completions` successes logged anything, and only
+ * under PUKU_PROXY_DEBUG: 401s, 400s, 404s and oversized-body rejections were
+ * entirely invisible, so a client seeing an error had no server-side trace to
+ * correlate against.
+ */
+function logRequest(
+  id: string,
+  req: Request,
+  status: number,
+  startedAt: number,
+  note?: string
+): void {
+  const ms = Date.now() - startedAt;
+  const path = new URL(req.url).pathname;
+  const level = status >= 500 ? "error" : status >= 400 ? "warn" : "info";
+  const line = `[${id}] ${level} ${req.method} ${path} ${status} ${ms}ms${note ? ` — ${note}` : ""}`;
+  if (status >= 500) console.error(line);
+  else console.warn(line);
+}
+
 // ---- Route handlers ----
 
 async function handleModels(): Promise<Response> {
   return jsonOk(getModelList());
 }
 
-async function handleChat(req: Request): Promise<Response> {
+export async function handleChat(req: Request): Promise<Response> {
   const id = nextRequestId();
+  const startedAt = Date.now();
   if (debugEnabled) {
     debug(id, `entry method=${req.method} url=${new URL(req.url).pathname}`);
     debug(
@@ -80,10 +104,34 @@ async function handleChat(req: Request): Promise<Response> {
   }
 
   // 1. Parse + validate.
+  //
+  // Read the body ourselves rather than relying solely on Bun's
+  // maxRequestBodySize: that drops the connection mid-upload, which reaches
+  // the caller as an opaque socket error (undici: UND_ERR_SOCKET "other side
+  // closed") and logs nothing here. An explicit check returns a real 413 the
+  // client can act on, and leaves a trace.
+  let bodyText: string;
+  try {
+    bodyText = await req.text();
+  } catch (err) {
+    logRequest(id, req, 400, startedAt, "could not read request body");
+    return jsonError("could not read request body", "invalid_request_error", 400);
+  }
+  if (bodyText.length > MAX_REQUEST_BODY_BYTES) {
+    const mb = (bodyText.length / 1_000_000).toFixed(1);
+    logRequest(id, req, 413, startedAt, `body ${mb}MB exceeds limit`);
+    return jsonError(
+      `request body is ${mb}MB, which exceeds the ${MAX_REQUEST_BODY_BYTES / 1_000_000}MB limit`,
+      "invalid_request_error",
+      413
+    );
+  }
+
   let raw: unknown;
   try {
-    raw = await req.json();
+    raw = JSON.parse(bodyText);
   } catch {
+    logRequest(id, req, 400, startedAt, "invalid JSON");
     return jsonError("request body must be valid JSON", "invalid_request_error", 400);
   }
 
@@ -94,6 +142,7 @@ async function handleChat(req: Request): Promise<Response> {
 
   const parsed = ChatRequestSchema.safeParse(raw);
   if (!parsed.success) {
+    logRequest(id, req, 400, startedAt, "schema validation failed");
     return jsonError(
       `validation failed: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`,
       "invalid_request_error",
@@ -351,11 +400,15 @@ await startModelListRefresh();
 
 const server = Bun.serve({
   port,
-  // Each chat request spawns a puku-cli subprocess, so an oversized prompt is
-  // an expensive request. Cap the body well below anything a legitimate
-  // conversation needs; Bun rejects larger payloads before we allocate them.
-  maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
+  // Deliberately well above MAX_REQUEST_BODY_BYTES. Bun enforces this by
+  // resetting the connection, which the caller sees as an opaque socket error
+  // (undici reports UND_ERR_SOCKET "other side closed") and which never
+  // reaches our handler, so nothing gets logged. handleChat does the real
+  // check and returns a 413 the client can read. This is only a backstop
+  // against a body too large to buffer at all.
+  maxRequestBodySize: MAX_REQUEST_BODY_BYTES * 10,
   async fetch(req) {
+    const reqStart = Date.now();
     const url = new URL(req.url);
 
     if (req.method === "GET" && url.pathname === "/healthz") {
@@ -364,14 +417,23 @@ const server = Bun.serve({
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       const authErr = verifyRequest(req, tokens);
-      if (authErr) return authErr;
-      return handleModels();
+      if (authErr) {
+        logRequest(nextRequestId(), req, 401, reqStart, "auth rejected");
+        return authErr;
+      }
+      const res = await handleModels();
+      logRequest(nextRequestId(), req, res.status, reqStart);
+      return res;
     }
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       const authErr = verifyRequest(req, tokens);
-      if (authErr) return authErr;
+      if (authErr) {
+        logRequest(nextRequestId(), req, 401, reqStart, "auth rejected");
+        return authErr;
+      }
       return handleChat(req);
     }
+    logRequest(nextRequestId(), req, 404, reqStart);
     return jsonError(`not found: ${req.method} ${url.pathname}`, "not_found_error", 404);
   },
   error(err) {
