@@ -34,3 +34,40 @@ jobs:
       # before it reaches the host.
       - name: Build image
         run: docker build --build-arg CACHEBUST=ci-${{ github.sha }} -t puku-proxy:ci .
+
+      # A built image that serves nothing is still a broken deploy. The
+      # bootstrap is guarded by `import.meta.main`, which depends on how the
+      # bundle is produced, so prove the container actually answers rather
+      # than assuming the build implies it.
+      - name: Smoke test the image
+        run: |
+          docker run -d --name puku-ci \
+            -e PUKU_PROXY_AUTH_KEYS=ci_smoke_token \
+            -p 8787:8787 puku-proxy:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/healthz >/dev/null 2>&1; then
+              echo "healthz responded after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::container never answered /healthz"
+              docker logs puku-ci
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/healthz
+          # Auth must be enforced, not merely configured.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8787/v1/chat/completions \
+            -H 'content-type: application/json' \
+            -d '{"model":"m","messages":[{"role":"user","content":"hi"}]}')
+          if [ "$code" != "401" ]; then
+            echo "::error::unauthenticated request returned $code, expected 401"
+            exit 1
+          fi
+          echo "unauthenticated request correctly rejected with 401"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs puku-ci || true

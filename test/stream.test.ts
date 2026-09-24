@@ -138,6 +138,53 @@ describe("incremental delivery", () => {
  });
 });
 
+describe("client disconnect", () => {
+ // When the client hangs up, Bun aborts req.signal and the SDK throws
+ // AbortError("Transport aborted"). That is normal traffic, not a server
+ // fault: nobody is left to receive an error frame, and logging it as a
+ // failure floods production logs — observed as ~90 lines per disconnect,
+ // twice, including the whole DOMException constant table.
+ function abortedUpstream(signal: AbortSignal | undefined) {
+  return async function* (): AsyncIterable<unknown> {
+   yield startMsg;
+   yield deltaMsg("partial");
+   const err = new Error("Transport aborted");
+   err.name = "AbortError";
+   void signal;
+   throw err;
+  };
+ }
+
+ test("an aborted stream is classified as a disconnect, not a server error", async () => {
+  const controller = new AbortController();
+  controller.abort(new DOMException("connection was closed.", "AbortError"));
+  const frames = await readFrames(
+   streamChat(request, controller.signal, "d1", abortedUpstream(controller.signal)),
+  );
+  // No error frame: the client is gone, so there is nobody to inform.
+  expect(frames.some((f) => f.body.includes('"server_error"'))).toBe(false);
+ });
+
+ test("an aborted stream still closes cleanly", async () => {
+  const controller = new AbortController();
+  controller.abort(new DOMException("connection was closed.", "AbortError"));
+  const frames = await readFrames(
+   streamChat(request, controller.signal, "d2", abortedUpstream(controller.signal)),
+  );
+  // Terminating is still correct — it releases the ReadableStream.
+  expect(frames[frames.length - 1]?.body).toBe("data: [DONE]\n\n");
+ });
+
+ test("an upstream failure with no client abort is still a server error", async () => {
+  // The discriminator: same throw, but signal not aborted => genuine fault,
+  // and the client must be told.
+  const frames = await readFrames(
+   streamChat(request, undefined, "d3", () => failing()),
+  );
+  expect(frames.some((f) => f.body.includes('"server_error"'))).toBe(true);
+ });
+});
+
 describe("truncated upstream", () => {
  // puku-cli can die mid-generation and still exit 0 (or be SIGKILLed, e.g.
  // OOM), in which case the SDK yields no error and the iterable simply ends

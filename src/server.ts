@@ -49,6 +49,20 @@ function jsonOk<T>(body: T, status = 200): Response {
   return Response.json(body, { status, headers: { "content-type": "application/json" } });
 }
 
+/**
+ * Whether a thrown error is just the client hanging up.
+ *
+ * Bun aborts `req.signal` on disconnect and the SDK surfaces that as
+ * `AbortError: Transport aborted`. It is ordinary traffic — a user closing a
+ * tab — not a server fault, and there is no longer anyone to send an error
+ * frame to. Treating it as a failure produced ~90 log lines per disconnect
+ * (the whole DOMException constant table, logged twice).
+ */
+function isClientDisconnect(err: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal?.aborted) return true;
+  return err instanceof Error && err.name === "AbortError";
+}
+
 // ---- Route handlers ----
 
 async function handleModels(): Promise<Response> {
@@ -121,8 +135,12 @@ async function nonStreamChat(
       }
     }
   } catch (err) {
+    if (isClientDisconnect(err, signal)) {
+      console.log(`[${id}] client disconnected before completion`);
+      return jsonError("client disconnected", "invalid_request_error", 499);
+    }
     debug(id, `non-stream error (signal.aborted=${signal?.aborted}):`, err);
-    console.error(`[${id}] non-stream error:`, err);
+    console.error(`[${id}] non-stream error:`, err instanceof Error ? err.message : err);
     return jsonError(
       err instanceof Error ? err.message : String(err),
       "server_error",
@@ -230,12 +248,25 @@ export function streamChat(
           }
         }
       } catch (err) {
+        if (isClientDisconnect(err, signal)) {
+          // Nobody is listening; terminate the stream and move on. One line,
+          // no stack: this is expected traffic.
+          console.log(`[${id}] client disconnected after ${emitted} chunks`);
+          clearInterval(heartbeat);
+          try {
+            write(sseDone());
+          } catch {
+            // controller already closed — the usual case here
+          }
+          close();
+          return;
+        }
         debug(
           id,
           `stream error after ${heartbeatCount} heartbeats, ${emitted} chunks, signal.aborted=${signal?.aborted}, signal.reason=${JSON.stringify(signal?.reason)}:`,
           err
         );
-        console.error(`[${id}] stream error:`, err);
+        console.error(`[${id}] stream error:`, err instanceof Error ? err.message : err);
         // Surface the error as a normal data frame: the OpenAI SDKs only
         // parse `data:`, so a bare `event: error` is invisible to them.
         const errPayload: OpenAIError = {
