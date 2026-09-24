@@ -417,12 +417,20 @@ await startModelListRefresh();
 
 const server = Bun.serve({
   port,
-  // Deliberately well above MAX_REQUEST_BODY_BYTES. Bun enforces this by
-  // resetting the connection, which the caller sees as an opaque socket error
-  // (undici reports UND_ERR_SOCKET "other side closed") and which never
-  // reaches our handler, so nothing gets logged. handleChat does the real
-  // check and returns a 413 the client can read. This is only a backstop
-  // against a body too large to buffer at all.
+  // Memory backstop, deliberately 10x the policy limit and derived from it so
+  // the two cannot drift: raising PUKU_PROXY_MAX_BODY_BYTES widens the gap
+  // rather than closing it.
+  //
+  // Bun enforces this by resetting the connection, which the caller sees as an
+  // opaque socket error (undici reports UND_ERR_SOCKET "other side closed")
+  // and which never reaches a handler, so nothing is logged. That is why it
+  // must not be the operative limit: handleChat checks MAX_REQUEST_BODY_BYTES
+  // itself and returns a readable, logged 413.
+  //
+  // Growing traffic cannot reach this quietly — any body big enough to hit it
+  // has already passed the policy limit and been rejected with a 413. Only a
+  // single request 10x the configured limit gets here, which is a client bug
+  // or abuse, and refusing to buffer it is the right answer.
   maxRequestBodySize: MAX_REQUEST_BODY_BYTES * 10,
   async fetch(req) {
     const reqStart = Date.now();
