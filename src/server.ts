@@ -41,6 +41,31 @@ import { debug, debugEnabled, nextRequestId } from "./debug.ts";
  * show conversations of 175 messages — and rejecting those is worse than
  * serving them. Tune it rather than removing it.
  */
+/**
+ * SSE keep-alive interval, in milliseconds. Override with
+ * `PUKU_PROXY_HEARTBEAT_MS`.
+ *
+ * puku-cli routinely takes 6-10s to produce a first token on long
+ * conversations. Production logs showed clients abandoning requests at 8-12s
+ * while this was 15s, so every stream recorded "0 heartbeats" — the keep-alive
+ * never fired once, and a silent connection looked dead to the client, which
+ * then retried the same conversation up to four times.
+ *
+ * 3s puts several frames inside the shortest observed patience window. SSE
+ * comment lines are two bytes of overhead and are ignored by every compliant
+ * parser, so erring short is cheap.
+ */
+const HEARTBEAT_MS = (() => {
+  const raw = process.env["PUKU_PROXY_HEARTBEAT_MS"];
+  if (!raw) return 3_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`[config] PUKU_PROXY_HEARTBEAT_MS="${raw}" is not a positive number; using 3000`);
+    return 3_000;
+  }
+  return parsed;
+})();
+
 const MAX_REQUEST_BODY_BYTES = (() => {
   const raw = process.env["PUKU_PROXY_MAX_BODY_BYTES"];
   if (!raw) return 5_000_000;
@@ -284,6 +309,15 @@ export function streamChat(
       // killing the request before any data flows. Emit an SSE comment
       // (lines starting with `:` are ignored by OpenAI clients and SSE
       // parsers) every 15s while we're still buffering the upstream messages.
+      // Emit one immediately: the gap before the first token is the whole
+      // problem, so waiting a full interval before the first keep-alive leaves
+      // the riskiest window uncovered.
+      try {
+        write(": keep-alive\n\n");
+      } catch {
+        // controller already closed
+      }
+
       const heartbeat = setInterval(() => {
         heartbeatCount += 1;
         try {
@@ -295,7 +329,7 @@ export function streamChat(
         } catch {
           // controller already closed; that's fine, the timer just needs to stop
         }
-      }, 15_000);
+      }, HEARTBEAT_MS);
 
       // Translate and emit each upstream message as it arrives. The
       // translator is a state machine: it carries usage forward across

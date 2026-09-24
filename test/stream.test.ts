@@ -138,6 +138,55 @@ describe("incremental delivery", () => {
  });
 });
 
+describe("keep-alive during upstream think-time", () => {
+ // puku-cli takes 6-10s to produce a first token on long conversations.
+ // Production logs showed clients abandoning at 8-12s while the heartbeat
+ // interval was 15s, so it never fired and the connection looked dead.
+ // Real delays are used because the property is that bytes reach the client
+ // during a genuine silence; a fake clock cannot express that.
+ function slowFirstToken(delayMs: number) {
+  return async function* (): AsyncIterable<unknown> {
+   yield startMsg;
+   await Bun.sleep(delayMs);
+   yield deltaMsg("finally");
+   yield stopMsg;
+  };
+ }
+
+ test("bytes reach the client before the first token arrives", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "h1", slowFirstToken(200)),
+  );
+  // Keep-alives are SSE comments, ignored by parsers but enough to keep the
+  // connection and any intermediary from treating it as idle.
+  const keepAlives = frames.filter((f) => f.body.startsWith(":"));
+  expect(keepAlives.length).toBeGreaterThan(0);
+ });
+
+ test("the first keep-alive does not wait a full interval", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "h2", slowFirstToken(120)),
+  );
+  const first = frames.find((f) => f.body.startsWith(":"));
+  expect(first).toBeDefined();
+  // Must land far sooner than the 3s interval; it is emitted immediately.
+  expect(first!.at).toBeLessThan(500);
+ });
+
+ test("keep-alives do not corrupt the data stream", async () => {
+  const frames = await readFrames(
+   streamChat(request, undefined, "h3", slowFirstToken(100)),
+  );
+  const data = frames.filter((f) => f.body.startsWith("data: "));
+  const text = data
+   .filter((f) => !f.body.includes("[DONE]"))
+   .map((f) => JSON.parse(f.body.slice(6)).choices[0].delta?.content ?? "")
+   .join("");
+  expect(text).toBe("finally");
+  expect(frames[frames.length - 1]!.body).toBe("data: [DONE]\n\n");
+ });
+});
+
 describe("client disconnect", () => {
  // When the client hangs up, Bun aborts req.signal and the SDK throws
  // AbortError("Transport aborted"). That is normal traffic, not a server
@@ -159,7 +208,12 @@ describe("client disconnect", () => {
   const controller = new AbortController();
   controller.abort(new DOMException("connection was closed.", "AbortError"));
   const frames = await readFrames(
-   streamChat(request, controller.signal, "d1", abortedUpstream(controller.signal)),
+   streamChat(
+    request,
+    controller.signal,
+    "d1",
+    abortedUpstream(controller.signal),
+   ),
   );
   // No error frame: the client is gone, so there is nobody to inform.
   expect(frames.some((f) => f.body.includes('"server_error"'))).toBe(false);
@@ -169,7 +223,12 @@ describe("client disconnect", () => {
   const controller = new AbortController();
   controller.abort(new DOMException("connection was closed.", "AbortError"));
   const frames = await readFrames(
-   streamChat(request, controller.signal, "d2", abortedUpstream(controller.signal)),
+   streamChat(
+    request,
+    controller.signal,
+    "d2",
+    abortedUpstream(controller.signal),
+   ),
   );
   // Terminating is still correct — it releases the ReadableStream.
   expect(frames[frames.length - 1]?.body).toBe("data: [DONE]\n\n");
@@ -341,12 +400,14 @@ describe("usage reporting across upstream orderings", () => {
 });
 
 describe("wire format", () => {
- test("every frame is a well-formed SSE data event", async () => {
+ test("every frame is a well-formed SSE event", async () => {
   const frames = await readFrames(
    streamChat(request, undefined, "t9", paced(["a", "b"], 1)),
   );
   for (const f of frames) {
-   expect(f.body.startsWith("data: ")).toBe(true);
+   // Two valid frame kinds: `data:` payloads and `:` comments (keep-alives,
+   // which every compliant SSE parser ignores).
+   expect(f.body.startsWith("data: ") || f.body.startsWith(":")).toBe(true);
    expect(f.body.endsWith("\n\n")).toBe(true);
   }
  });
